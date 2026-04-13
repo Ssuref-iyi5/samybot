@@ -1,4 +1,4 @@
-[13/04/2026 21:14] Massi Haddad: const TelegramBot = require('node-telegram-bot-api');
+const TelegramBot = require('node-telegram-bot-api');
 const Groq = require('groq-sdk');
 const cron = require('node-cron');
 const fs = require('fs');
