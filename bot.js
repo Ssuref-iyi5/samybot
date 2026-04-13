@@ -1,7 +1,6 @@
-[13/04/2026 20:47] Massi Haddad: const TelegramBot = require('node-telegram-bot-api');
+[13/04/2026 21:14] Massi Haddad: const TelegramBot = require('node-telegram-bot-api');
 const Groq = require('groq-sdk');
 const cron = require('node-cron');
-const Database = require('better-sqlite3');
 const fs = require('fs');
 const path = require('path');
 
@@ -16,37 +15,30 @@ const GROQ_API_KEY = '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';
 // ========================
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const groq = new Groq({ apiKey: GROQ_API_KEY });
-const db = new Database('assistant.db');
 
 // ========================
-// BASE DE DONNÉES
+// BASE DE DONNÉES JSON
 // ========================
-db.exec(
-  CREATE TABLE IF NOT EXISTS reminders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    message TEXT NOT NULL,
-    remind_at TEXT NOT NULL,
-    done INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
+const DB_FILE = '/tmp/samybot_data.json';
 
-  CREATE TABLE IF NOT EXISTS memory (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    key TEXT NOT NULL,
-    value TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    }
+  } catch(e) {}
+  return { reminders: [], memory: [] };
+}
 
-  CREATE TABLE IF NOT EXISTS conversations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-);
+function saveDB(data) {
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+  } catch(e) {
+    console.error('Erreur sauvegarde:', e);
+  }
+}
+
+let dbData = loadDB();
 
 // ========================
 // MÉMOIRE CONVERSATION
@@ -124,15 +116,22 @@ ${memoryText};
 // TRAITEMENT RÉPONSE IA
 // ========================
 async function processAIResponse(chatId, aiResponse) {
-[13/04/2026 20:47] Massi Haddad: let cleanResponse = aiResponse;
+  let cleanResponse = aiResponse;
   
   // Vérifie si y'a un rappel à créer
   const reminderMatch = aiResponse.match(/RAPPEL:(\{[^}]+\})/);
   if (reminderMatch) {
     try {
       const reminderData = JSON.parse(reminderMatch[1]);
-      db.prepare('INSERT INTO reminders (chat_id, message, remind_at) VALUES (?, ?, ?)')
-        .run(chatId, reminderData.message, reminderData.datetime);
+      dbData = loadDB();
+      dbData.reminders.push({
+        id: Date.now(),
+        chat_id: chatId,
+[13/04/2026 21:14] Massi Haddad: message: reminderData.message,
+        remind_at: reminderData.datetime,
+        done: 0
+      });
+      saveDB(dbData);
       cleanResponse = cleanResponse.replace(/RAPPEL:\{[^}]+\}/, '').trim();
       cleanResponse += \n\n⏰ Rappel créé pour le ${new Date(reminderData.datetime).toLocaleString('fr-FR')} !;
     } catch (e) {
@@ -145,8 +144,14 @@ async function processAIResponse(chatId, aiResponse) {
   if (memoryMatch) {
     try {
       const memData = JSON.parse(memoryMatch[1]);
-      db.prepare('INSERT OR REPLACE INTO memory (chat_id, key, value) VALUES (?, ?, ?)')
-        .run(chatId, memData.key, memData.value);
+      dbData = loadDB();
+      const existing = dbData.memory.findIndex(m => m.chat_id === chatId && m.key === memData.key);
+      if (existing >= 0) {
+        dbData.memory[existing].value = memData.value;
+      } else {
+        dbData.memory.push({ chat_id: chatId, key: memData.key, value: memData.value });
+      }
+      saveDB(dbData);
       cleanResponse = cleanResponse.replace(/MEMOIRE:\{[^}]+\}/, '').trim();
       cleanResponse += \n\n🧠 J'ai mémorisé : ${memData.key} = ${memData.value};
     } catch (e) {
@@ -162,17 +167,18 @@ async function processAIResponse(chatId, aiResponse) {
 // ========================
 cron.schedule('* * * * *', () => {
   const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
-  const dueReminders = db.prepare(
-    'SELECT * FROM reminders WHERE remind_at <= ? AND done = 0'
-  ).all(now);
+  dbData = loadDB();
+  const dueReminders = dbData.reminders.filter(r => r.remind_at <= now && r.done === 0);
 
   dueReminders.forEach(reminder => {
     bot.sendMessage(reminder.chat_id, 
       ⏰ *RAPPEL !*\n\n${reminder.message}\n\nC'est fait ? Réponds *oui* ou *non* !,
       { parse_mode: 'Markdown' }
     );
-    db.prepare('UPDATE reminders SET done = 1 WHERE id = ?').run(reminder.id);
+    reminder.done = 1;
   });
+  
+  if (dueReminders.length > 0) saveDB(dbData);
 });
 
 // ========================
@@ -198,9 +204,9 @@ bot.onText(/\/start/, (msg) => {
 
 bot.onText(/\/rappels/, (msg) => {
   const chatId = msg.chat.id;
-  const reminders = db.prepare(
-    'SELECT * FROM reminders WHERE chat_id = ? AND done = 0 ORDER BY remind_at ASC'
-  ).all(chatId);
+  dbData = loadDB();
+  const reminders = dbData.reminders.filter(r => r.chat_id === chatId && r.done === 0)
+    .sort((a, b) => a.remind_at.localeCompare(b.remind_at));
 
   if (reminders.length === 0) {
     bot.sendMessage(chatId, '📅 Aucun rappel en attente ! Tout est bon 👍');
@@ -217,7 +223,8 @@ bot.onText(/\/rappels/, (msg) => {
 
 bot.onText(/\/memoire/, (msg) => {
   const chatId = msg.chat.id;
-  const memories = db.prepare('SELECT * FROM memory WHERE chat_id = ?').all(chatId);
+  dbData = loadDB();
+  const memories = dbData.memory.filter(m => m.chat_id === chatId);
 
   if (memories.length === 0) {
     bot.sendMessage(chatId, "🧠 Je n'ai encore rien mémorisé sur toi !");
@@ -239,7 +246,7 @@ bot.onText(/\/aide/, (msg) => {
     *Exemples :*\n +
     • "Rappelle-moi d'appeler le médecin demain à 9h"\n +
     • "N'oublie pas que mon rendez-vous est vendredi"\n +
-[13/04/2026 20:47] Massi Haddad: • "Mémorise que mon code wifi est 1234"\n +
+    • "Mémorise que mon code wifi est 1234"\n +
     • "Qu'est-ce que j'ai prévu aujourd'hui ?"\n\n +
     *Commandes :*\n +
     /rappels - Voir tes rappels\n +
@@ -248,8 +255,7 @@ bot.onText(/\/aide/, (msg) => {
     { parse_mode: 'Markdown' }
   );
 });
-
-// ========================
+[13/04/2026 21:14] Massi Haddad: // ========================
 // MESSAGE TEXTE PRINCIPAL
 // ========================
 bot.on('message', async (msg) => {
